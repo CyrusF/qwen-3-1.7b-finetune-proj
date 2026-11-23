@@ -81,6 +81,7 @@ def judge_one(client, prompt, answer, cut_off=False, attempts=2, max_tokens=1000
     recorded as a judge error. Errors that would fail every call (bad key, bad
     model name) raise FatalAPIError instead."""
     usage = dict(calls=0, input_tokens=0, cached_input_tokens=0, output_tokens=0)
+    request_ids = []
     error = None
     for _ in range(attempts):
         try:
@@ -90,15 +91,21 @@ def judge_one(client, prompt, answer, cut_off=False, attempts=2, max_tokens=1000
             raise
         except Exception as exc: # rate limits or network errors left after the client's own retries
             error = f'{type(exc).__name__}: {exc}'
+            if getattr(exc, 'request_id', None):
+                request_ids.append(exc.request_id)
             continue
+        if result.request_id:
+            request_ids.append(result.request_id)
         usage['calls'] += 1
         for key in ('input_tokens', 'cached_input_tokens', 'output_tokens'):
             usage[key] += getattr(result, key)
         try:
-            return dict(parse_reply(result.text), error=None, model=result.model, usage=usage)
+            return dict(parse_reply(result.text), error=None, model=result.model, usage=usage,
+                        request_ids=request_ids)
         except ValueError as exc:
             error = f'unreadable reply: {exc}; reply was {result.text[:200]!r}'
-    return dict(coherence=None, responds=None, note=None, error=error, model=None, usage=usage)
+    return dict(coherence=None, responds=None, note=None, error=error, model=None, usage=usage,
+                request_ids=request_ids)
 
 
 def judge_many(client, items, workers=8, on_result=None):

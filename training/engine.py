@@ -64,4 +64,6 @@ class TrainingEngine:
           device = torch.device(self.device)
           if device.type == "cuda":
                torch.cuda.synchronize(device) # since cuda runs async we need to sync periodically (whenever we want to measure)
+          elif device.type == "mps":
+               torch.mps.synchronize()
           return time.perf_counter()

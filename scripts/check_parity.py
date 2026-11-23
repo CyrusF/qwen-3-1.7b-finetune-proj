@@ -4,10 +4,14 @@ produces the same numbers as running without one.
     python -m scripts.check_parity
 """
 
+import argparse
 import gc
+import json
+from pathlib import Path
 
 import torch
 
+from core.devices import resolve_device
 from core.model import Qwen3ForCausalLM
 from core.utils import load_qwen3_weights, get_encoder
 
@@ -26,19 +30,19 @@ def make_batch(tokenizer, prompts, device):
     return ids, mask, positions
 
 
-def free(*objs):
-    for o in objs:
-        del o
+def free(device):
     gc.collect()
-    if torch.cuda.is_available():
+    if device.type == "cuda":
         torch.cuda.empty_cache()
+    elif device.type == "mps":
+        torch.mps.empty_cache()
 
 
 def report(name, a, b, mask=None):
     """Print the largest difference between two logit tensors, per batch row."""
     diff = (a.float() - b.float()).abs()
     if mask is not None:
-        diff = diff * mask.unsqueeze(-1)  # ignore positions that are padding
+        diff = diff.masked_fill(~mask.unsqueeze(-1).bool(), 0)
 
     worst = diff.max().item()
     status = "PASS" if worst < TOLERANCE else "FAIL"
@@ -47,27 +51,30 @@ def report(name, a, b, mask=None):
     if diff.size(0) > 1:
         for row in range(diff.size(0)):
             print(f"           row {row}: {diff[row].max().item():.6f}")
-    return worst < TOLERANCE
+    return dict(name=name, max_diff=worst if torch.isfinite(diff).all() else None,
+                passed=worst < TOLERANCE)
 
 
 
-def hf_logits(prompts, tokenizer, device):
+def hf_logits(tokenizer, device, weights_dir, prompt_sets):
     from transformers import Qwen3ForCausalLM as HFQwen3
 
     hf = HFQwen3.from_pretrained(
-        "./weights/qwen3-1.7b",
+        weights_dir or "./weights/qwen3-1.7b",
         dtype=torch.float32,
         attn_implementation="eager",  # match the hand-written attention
+        local_files_only=True,
     ).to(device).eval()
 
-    ids, mask, positions = make_batch(tokenizer, prompts, device)
-
+    results = []
     with torch.no_grad():
-        out = hf(input_ids=ids, attention_mask=mask, position_ids=positions).logits
-
-    out = out.cpu()
-    free(hf)
-    return out
+        for prompts in prompt_sets:
+            ids, mask, positions = make_batch(tokenizer, prompts, device)
+            results.append(hf(input_ids=ids, attention_mask=mask, position_ids=positions,
+                              use_cache=False).logits.cpu())
+    del hf
+    free(device)
+    return results
 
 
 def ours_no_cache(model, ids, mask, positions, num_layers):
@@ -95,28 +102,27 @@ def ours_token_by_token(model, ids, mask, positions, num_layers):
     return torch.cat(steps, dim=1)
 
 
-def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def main(device=None, weights_dir=None, report_path=None):
+    device = resolve_device(device)
     print(f"device: {device}\n")
 
-    cfg, sd = load_qwen3_weights()
-    num_layers = cfg.num_hidden_layers
-
-    tokenizer = get_encoder()
+    tokenizer = get_encoder(weights_dir)
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
 
     # huggingface first, then free it - two fp32 copies of a 1.7b model do not
     # fit on a 16gb card at the same time
     print("loading huggingface reference...")
-    ref_single = hf_logits(PROMPTS_SINGLE, tokenizer, device)
-    ref_ragged = hf_logits(PROMPTS_RAGGED, tokenizer, device)
+    ref_single, ref_ragged = hf_logits(tokenizer, device, weights_dir, [PROMPTS_SINGLE, PROMPTS_RAGGED])
 
     print("loading our model...")
+    cfg, sd = load_qwen3_weights(weights_dir)
+    num_layers = cfg.num_hidden_layers
     model = Qwen3ForCausalLM(cfg)
     model.load_state_dict(sd, strict=False)
     model.to(device).eval()
-    free(sd)
+    del sd
+    free(device)
 
     passed = []
 
@@ -124,23 +130,31 @@ def main():
 
     ids, mask, positions = make_batch(tokenizer, PROMPTS_SINGLE, device)
     ours = ours_no_cache(model, ids, mask, positions, num_layers)
-    passed.append(report("single prompt", ours.cpu(), ref_single))
+    passed.append(report("HF / single prompt", ours.cpu(), ref_single))
 
     ids_r, mask_r, pos_r = make_batch(tokenizer, PROMPTS_RAGGED, device)
     ours_r = ours_no_cache(model, ids_r, mask_r, pos_r, num_layers)
-    passed.append(report("ragged batch", ours_r.cpu(), ref_ragged, mask=mask_r.cpu()))
+    passed.append(report("HF / ragged batch", ours_r.cpu(), ref_ragged, mask=mask_r.cpu()))
 
     print("\n2. cached decode vs single forward pass")
 
     stepped = ours_token_by_token(model, ids, mask, positions, num_layers)
-    passed.append(report("single prompt", stepped, ours))
+    passed.append(report("KV cache / single prompt", stepped.cpu(), ours.cpu()))
 
     stepped_r = ours_token_by_token(model, ids_r, mask_r, pos_r, num_layers)
-    passed.append(report("ragged batch", stepped_r, ours_r, mask=mask_r))
+    passed.append(report("KV cache / ragged batch", stepped_r.cpu(), ours_r.cpu(), mask=mask_r.cpu()))
 
-    print(f"\n{sum(passed)}/{len(passed)} checks passed")
-    return 0 if all(passed) else 1
+    count = sum(check["passed"] for check in passed)
+    print(f"\n{count}/{len(passed)} checks passed")
+    if report_path:
+        Path(report_path).write_text(json.dumps(dict(device=str(device), dtype="float32",
+                                                   tolerance=TOLERANCE, checks=passed), indent=2))
+    return 0 if count == len(passed) else 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device")
+    parser.add_argument("--weights-dir")
+    parser.add_argument("--report-path")
+    raise SystemExit(main(**vars(parser.parse_args())))

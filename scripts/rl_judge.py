@@ -22,6 +22,7 @@ import time
 import torch
 
 from core.checks import e_pass
+from core.devices import autocast, mps_memory, resolve_device
 from core.judge import judge_many, make_judge_client, reward, usable
 from core.model import Qwen3ForCausalLM
 from core.sampling import build_forbidden_token_mask
@@ -38,8 +39,9 @@ def read_rows(path):
     return [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
 
 
-def load_model(start_adapter=None):
-    cfg, state = load_qwen3_weights()
+def load_model(start_adapter=None, device=None, weights_dir=None):
+    device = resolve_device(device, require_accelerator=True)
+    cfg, state = load_qwen3_weights(weights_dir)
     previous_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
@@ -48,13 +50,15 @@ def load_model(start_adapter=None):
         torch.set_default_dtype(previous_dtype)
     model.load_state_dict(state, strict=False)
     del state
-    if start_adapter is not None:
-        load_checkpoint(start_adapter, model, None)
     for name, parameter in model.named_parameters():
         parameter.requires_grad = name.endswith(('.A', '.B'))
         if parameter.requires_grad:
             parameter.data = parameter.data.float()
-    return model.cuda()
+    if start_adapter is not None:
+        if not Path(start_adapter).is_file():
+            raise FileNotFoundError(start_adapter)
+        load_checkpoint(start_adapter, model, None)
+    return model.to(device)
 
 
 def prompt_batches(rows, tokenizer, prompts_per_step, seed):
@@ -83,6 +87,7 @@ class JudgeReward:
         self.step, self.ids, self.last, self.judge_seconds = 0, None, [], 0.0
 
     def __call__(self, tokens, reward_mask, prompts):
+        tokens, reward_mask = tokens.cpu(), reward_mask.cpu()
         groups, batch = tokens.shape[:2]
         eos = self.tokenizer.eos_token_id
         answers, items = {}, []
@@ -121,42 +126,54 @@ def main(run_dir, prompts, start_adapter=None, masked=True, max_steps=300, promp
          group_size=8, temperature=0.7, max_new_tokens=300, learning_rate=2e-5, kl_beta=0.02,
          eps=0.2, micro_batch_size=4, eval_every=25, eval_prompts='data/prompts/short_eval_50.jsonl',
          eval_seeds=(0, 1, 2, 3), seed=0, judge_workers=16, start_eval=None, final_eval=True,
-         reward_combine='sum', fixed_length_loss=False):
+         reward_combine='sum', fixed_length_loss=False, device=None, weights_dir=None,
+         baseline_eval=False, stop_on_decline=True):
     """start_eval: an existing short-eval run of the starting point with the same eval
     settings; its usable rate is recorded as step 0. final_eval=False skips the eval at
     max_steps (for short smoke tests)."""
     reward(dict(coherence=5, responds=5), reward_combine)  # an unknown name fails before any work
+    device = resolve_device(device, require_accelerator=True)
+    if baseline_eval and start_eval is not None:
+        raise ValueError('Choose baseline_eval or start_eval')
     run_dir = Path(run_dir)
     if run_dir.exists():
         raise FileExistsError(f'Choose a new run_dir: {run_dir}')
     run_dir.mkdir(parents=True)
     pool = read_rows(prompts)
     evals = read_rows(eval_prompts)
+    if not 1 <= prompts_per_step <= len(pool) or min(max_steps, eval_every) < 1:
+        raise ValueError('Invalid prompt batch, step count or eval interval')
     overlap = {row['prompt'] for row in pool} & {row['prompt'] for row in evals}
     if overlap:
         raise ValueError(f'{len(overlap)} training prompts are eval prompts')
-    config = dict(prompts=str(prompts), pool_size=len(pool), start_adapter=start_adapter, masked=masked,
+    config = dict(prompts=str(prompts), pool_size=len(pool),
+                  start_adapter=str(start_adapter) if start_adapter is not None else None, masked=masked,
                   max_steps=max_steps, prompts_per_step=prompts_per_step, group_size=group_size,
                   temperature=temperature, max_new_tokens=max_new_tokens, learning_rate=learning_rate,
                   kl_beta=kl_beta, eps=eps, micro_batch_size=micro_batch_size, eval_every=eval_every,
                   eval_prompts=str(eval_prompts), eval_seeds=list(eval_seeds), seed=seed,
-                  start_eval=start_eval, reward_combine=reward_combine,
+                  start_eval=str(start_eval) if start_eval is not None else None, reward_combine=reward_combine,
                   loss_length=max_new_tokens if fixed_length_loss else 'each answer\'s own length',
                   system_prompt=NO_E_INSTRUCTION, thinking=False, ascii_only_mask=masked,
+                  device=str(device), precision='bf16', adapter_precision='float32',
+                  base_weights=str(weights_dir or ROOT / 'weights/qwen3-1.7b'), use_sdpa=True,
+                  baseline_eval=baseline_eval, stop_on_decline=stop_on_decline,
                   drift_anchor='start adapter' if start_adapter else 'base model (adapters off)')
     (run_dir / 'config.json').write_text(json.dumps(config, indent=2))
 
     # On WSL, going past the GPU's memory spills into system memory and slows every step
     # several-fold instead of failing; cap it so that shows up as an out-of-memory error.
-    free, total = torch.cuda.mem_get_info()
-    cap = min(14 * 1024**3, free - 1024**3)
-    torch.cuda.set_per_process_memory_fraction(cap / total)
+    if device.type == 'cuda':
+        free, total = torch.cuda.mem_get_info()
+        cap = min(14 * 1024**3, free - 1024**3)
+        torch.cuda.set_per_process_memory_fraction(cap / total)
     torch.manual_seed(seed)
-    tokenizer = get_encoder()
+    tokenizer = get_encoder(weights_dir)
     tokenizer.padding_side = 'left'
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = load_model(start_adapter)
+    client = make_judge_client()
+    model = load_model(start_adapter, device=device, weights_dir=weights_dir)
     # anchor the drift penalty to the starting adapters by swapping their values in,
     # instead of a second copy of the model (which does not fit next to training)
     ref_adapter_state = None
@@ -164,12 +181,12 @@ def main(run_dir, prompts, start_adapter=None, masked=True, max_steps=300, promp
         ref_adapter_state = {name: p.detach().clone() for name, p in model.named_parameters()
                              if name.endswith(('.A', '.B'))}
     forbidden = build_forbidden_token_mask(tokenizer, model.config.vocab_size, 'eE', ascii_only=True,
-                                           device='cuda') if masked else None
+                                           device=device) if masked else None
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=learning_rate)
     engine = GRPOEngine(model, tokenizer, optimizer, loss_backend='torch',
                         ref_adapter_state=ref_adapter_state, forbidden_token_mask=forbidden)
     engine.epoch, engine.global_step = 0, 0
-    reward_fn = JudgeReward(tokenizer, make_judge_client(), run_dir / 'answers.jsonl', masked, judge_workers,
+    reward_fn = JudgeReward(tokenizer, client, run_dir / 'answers.jsonl', masked, judge_workers,
                             reward_combine)
     batches = prompt_batches(pool, tokenizer, prompts_per_step, seed)
     metrics = (run_dir / 'metrics.jsonl').open('a')
@@ -181,12 +198,13 @@ def main(run_dir, prompts, start_adapter=None, masked=True, max_steps=300, promp
 
     def run_eval(step):
         eval_dir = run_dir / 'eval' / f'step_{step:04d}'
-        with torch.autocast('cuda', dtype=torch.bfloat16):
+        print(f'step {step}: starting eval', flush=True)
+        with autocast(device, torch.bfloat16):
             evaluate(model, tokenizer, evals, eval_dir, max_new_tokens=max_new_tokens, temperature=0.7,
                      seeds=list(eval_seeds), batch_size=8, no_e=True, mask_e=masked, ascii_only=masked,
                      metadata=dict(run_dir=str(run_dir), step=step))
         model.train()
-        summary = judge_run(eval_dir, workers=judge_workers)
+        summary = judge_run(eval_dir, workers=judge_workers, client=client)
         state['evals'].append(dict(step=step, usable_rate=summary['usable_rate'],
                                    readable_rate=summary['readable_rate'],
                                    middle_90=summary['usable_rate_middle_90']))
@@ -197,9 +215,10 @@ def main(run_dir, prompts, start_adapter=None, masked=True, max_steps=300, promp
         state['step'] += 1
         step = state['step']
         engine.global_step = step
-        reward_fn.step = step
         records = reward_fn.last
         scored = [r['reward'] for r in records if r['reward'] is not None]
+        memory = (dict(peak_gpu_gib=round(torch.cuda.max_memory_allocated() / 1024**3, 2))
+                  if device.type == 'cuda' else dict(mps_memory=mps_memory()))
         metrics.write(json.dumps(dict(
             step=step, seconds=round(time.monotonic() - state['started'], 1),
             judge_seconds=round(reward_fn.judge_seconds, 1),
@@ -207,11 +226,12 @@ def main(run_dir, prompts, start_adapter=None, masked=True, max_steps=300, promp
             usable=sum(bool(r['usable']) for r in records), answers=len(records),
             judge_errors=len(records) - len(scored), kl=info['kl'],
             sampling_vs_training_logprob_gap=info['logprob_gap'],
-            peak_gpu_gib=round(torch.cuda.max_memory_allocated() / 1024**3, 2),
             mean_answer_chars=sum(len(r['answer']) for r in records) / len(records),
-            cut_off=sum(r['cut_off'] for r in records))) + '\n')
+            cut_off=sum(r['cut_off'] for r in records), **memory)) + '\n')
         metrics.flush()
-        torch.cuda.reset_peak_memory_stats()
+        if device.type == 'cuda':
+            torch.cuda.reset_peak_memory_stats()
+        print(f'step {step}/{max_steps}: {len(scored)}/{len(records)} rewards, KL={info["kl"]}', flush=True)
         if step % eval_every == 0 or (step >= max_steps and final_eval):
             engine.save_checkpoint(run_dir / 'checkpoints' / f'step_{step:04d}.pt')
             (run_dir / f'answers_step_{step:04d}.txt').write_text('\n\n'.join(
@@ -219,7 +239,7 @@ def main(run_dir, prompts, start_adapter=None, masked=True, max_steps=300, promp
                 for r in random.Random(step).sample(records, min(10, len(records)))) + '\n')
             rates = [e['usable_rate'] for e in state['evals']] + [run_eval(step)]
             print(f'step {step}: eval usable {rates[-1]:.1%}', flush=True)
-            if len(rates) >= 3 and rates[-1] < rates[-2] < rates[-3]:
+            if stop_on_decline and len(rates) >= 3 and rates[-1] < rates[-2] < rates[-3]:
                 print('Stopping: usable rate fell at two evals in a row', flush=True)
                 return True
         return step >= max_steps
@@ -228,14 +248,23 @@ def main(run_dir, prompts, start_adapter=None, masked=True, max_steps=300, promp
         """Feeds endless batches and tells the reward which prompt ids it is scoring."""
         def __iter__(self):
             for batch in batches:
+                reward_fn.step = state['step'] + 1
                 reward_fn.ids = batch.pop('ids')
                 yield batch
 
-    with torch.autocast('cuda', dtype=torch.bfloat16):
-        engine.fit(Loader(), max_new_tokens=max_new_tokens, temperature=temperature, epochs=1,
-                   group_size=group_size, reward_fn=reward_fn, kl_beta=kl_beta, eps=eps,
-                   micro_batch_size=micro_batch_size, on_step=on_step, recompute_old_log_probs=True,
-                   parallel_groups=True, fixed_loss_length=max_new_tokens if fixed_length_loss else None)
+    try:
+        if baseline_eval:
+            run_eval(0)
+            torch.manual_seed(seed)
+            state['started'] = time.monotonic()
+        with autocast(device, torch.bfloat16):
+            engine.fit(Loader(), max_new_tokens=max_new_tokens, temperature=temperature, epochs=1,
+                       group_size=group_size, reward_fn=reward_fn, kl_beta=kl_beta, eps=eps,
+                       micro_batch_size=micro_batch_size, on_step=on_step, recompute_old_log_probs=True,
+                       parallel_groups=True, fixed_loss_length=max_new_tokens if fixed_length_loss else None)
+    finally:
+        metrics.close()
+        reward_fn.log.close()
     print(json.dumps(state['evals'], indent=2))
     return state['evals']
 

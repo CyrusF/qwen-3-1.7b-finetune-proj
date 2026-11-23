@@ -1,12 +1,17 @@
 # Teaching Qwen3-1.7B to write without the letter "e"
 
-Code, data, and results for my write-up *Post-training Qwen3 1.7B*: getting a small model to answer
-questions in lipograms (text with no `e` or `E`) that still read well and answer the question.
+[English](README.md) · [简体中文](README_ZH_CN.md)
 
-Everything here is written from scratch in PyTorch: the Qwen3 forward pass, LoRA, generation with a KV
-cache, an SFT engine, and a GRPO engine. It all ran on one 16 GB GPU.
+This fork adds a [local Apple Silicon course](#local-mps-course-apple-silicon) and a
+[Chinese source walkthrough](docs/mps_source_guide_zh_CN.md) for the original
+[*Post-training Qwen3 1.7B* project](https://github.com/kevinyvv/qwen-3-1.7b-finetune-proj).
+The task is to make Qwen3 answer questions clearly without using `e` or `E`.
 
-## Results
+The original experiment uses a hand-written PyTorch forward pass, LoRA (Low-Rank Adaptation),
+generation with a KV (Key–Value) cache, SFT (Supervised Fine-Tuning), and GRPO
+(Group Relative Policy Optimization). It ran on one 16 GB CUDA GPU.
+
+## Published CUDA results
 
 Each number is the **usable rate** on 200 answers (50 held-out prompts × 4 samples). An answer is usable
 if it contains no `e` and an LLM judge scores it at least 4 out of 5 on both coherence and answering the
@@ -21,12 +26,15 @@ prompt.
 | Baseline + 300 GRPO steps | 43% |
 | SFT adapter + 300 GRPO steps | **60.5%** |
 
-The mask handles the e rule on its own; training is about making the answers coherent under it.
+The token mask enforces the character constraint. Training helps the model answer coherently
+with the remaining tokens.
 
 ## Where to find things
 
 | Topic | Files |
 |---|---|
+| Local course and terminal presets | [`mps_lab/`](mps_lab/) |
+| MPS device checks, autocast, and memory reporting | [`core/devices.py`](core/devices.py) |
 | Qwen3 forward pass (RoPE, grouped-query attention, RMSNorm, KV cache) | [`core/model.py`](core/model.py) |
 | LoRA, and switching it off to get the reference model | [`core/layers.py`](core/layers.py) (`LoRALinear`, `lora_disabled`) |
 | The mask that blocks every token containing e | [`core/sampling.py`](core/sampling.py) (`build_forbidden_token_mask`) |
@@ -66,6 +74,58 @@ are not included.
 | [`runs/rl_20261016/`](runs/rl_20261016) | GRPO from the baseline and from the SFT adapter, evaluated every 25 steps |
 
 ## Running it
+
+### Local MPS course (Apple Silicon)
+
+The Chinese course walks through MPS (Metal Performance Shaders) setup, FP32 forward parity,
+small LoRA SFT, one GRPO update, and the two 300-step runs. Expand **源码导读** to open excerpts
+from the actual source. Run each experiment from the terminal. The read-only web UI displays
+logs, metrics, artifacts, and the published CUDA curves.
+
+```sh
+python3 -m mps_lab web
+```
+
+Open [Qwen3 MPS 实验课](http://127.0.0.1:8765) and copy the commands from each lesson. In a second
+terminal at the repository root, the short path is:
+
+```sh
+uv venv --python 3.13 .venv
+uv pip install --no-cache --python .venv/bin/python -r requirements-mps.txt
+.venv/bin/python -m mps_lab setup
+.venv/bin/python -m mps_lab parity
+.venv/bin/python -m mps_lab sft
+.venv/bin/python -m mps_lab grpo-one --adapter /path/to/latest.pt
+```
+
+Select the completed SFT run in the GRPO lesson to copy the command with its actual checkpoint
+path. The short experiments run offline once setup has downloaded the weights and tokenizer.
+
+The setup probe checks native MPS forward, backward, AdamW, and sampling. It downloads about
+4.08 GB of pinned Qwen3 weights. Allow 5 GiB before the initial download and budget around 12 GiB
+before installing and running the full course. To store weights and experiment outputs on another
+volume, set `MPS_LAB_DIR` to an absolute directory in both terminals before starting the server and
+running the experiments. Outputs otherwise go under `.mps-lab/runs/`.
+
+The final chapter has independent Base and SFT 180 routes. Put `OPENAI_API_KEY` in the environment or
+the repo's `.env` before running `judge-check`. Each route runs a local step 0 evaluation and about
+12,200 judge requests total, plus retries. Plan to run the two routes one at a time.
+
+```sh
+.venv/bin/python -m mps_lab judge-check
+.venv/bin/python -m mps_lab grpo300 base
+.venv/bin/python -m mps_lab sft180
+# Select the completed SFT 180 run to copy the command with its actual best.pt path.
+.venv/bin/python -m mps_lab grpo300 sft180 --adapter /path/to/best.pt
+```
+
+Use Ctrl+C in the experiment terminal to interrupt a run. You can inspect its saved files from
+the run selector. Rerunning a GRPO command starts a fresh run.
+
+Run `.venv/bin/python -m unittest discover -s tests -v` to check SFT gradient accumulation on a
+small CPU model and rehearse both GRPO routes on MPS with a small model and a simulated judge.
+
+### Original CUDA experiments
 
 You need a CUDA GPU for training and evaluation (16 GB was enough), and an OpenAI API key for the judge.
 

@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 from core.checks import e_pass
+from core.devices import autocast, resolve_device
 from core.generation import generate_rollout
 from core.model import Qwen3ForCausalLM
 from core.sampling import build_forbidden_token_mask
@@ -129,7 +130,7 @@ def main(data_path='data/prompts/val.jsonl', output_dir='runs/baseline/eval/val'
          path=None, max_new_tokens=768, thinking_budget=None, temperature=0.7,
          seed=0, batch_size=1, no_e=True, mask_e=False, use_sdpa=True, limit=None,
          weights_dir=None, ascii_only=False, forbidden_chars="", preserve_added_tokens=False,
-         seeds=None, judge=False, judge_workers=8):
+         seeds=None, judge=False, judge_workers=8, device=None):
     """judge=True scores the saved answers with the short-answer judge after generating."""
     if Path(output_dir).exists():
         raise FileExistsError(output_dir)
@@ -139,7 +140,8 @@ def main(data_path='data/prompts/val.jsonl', output_dir='runs/baseline/eval/val'
         rows = rows[:limit]
     torch.manual_seed(seed)
     cfg, state_dict = load_qwen3_weights(weights_dir)
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    device = resolve_device(device)
+    dtype = torch.float32 if device.type == 'cpu' else torch.bfloat16
     previous_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
     try:
@@ -148,22 +150,26 @@ def main(data_path='data/prompts/val.jsonl', output_dir='runs/baseline/eval/val'
         torch.set_default_dtype(previous_dtype)
     model.load_state_dict(state_dict, strict=False)
     del state_dict
+    if device.type == 'mps':
+        for name, parameter in model.named_parameters():
+            if name.endswith(('.A', '.B')):
+                parameter.data = parameter.data.float()
     if path is not None:
         if not Path(path).is_file():
             raise FileNotFoundError(path)
         load_checkpoint(path, model, None)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model.to(device=device, dtype=torch.bfloat16 if device == 'cuda' else torch.float32)
-    summary = evaluate(
-        model, get_encoder(), rows, output_dir, max_new_tokens, thinking_budget,
-        temperature, seed, batch_size, no_e, mask_e,
-        metadata={'data_path': str(data_path), 'data_sha256': hashlib.sha256(data).hexdigest(),
-                  'checkpoint': str(path) if path is not None else None,
-                  'use_sdpa': use_sdpa, 'limit': limit,
-                  'weights_dir': str(Path(weights_dir).resolve()) if weights_dir is not None else None},
-        ascii_only=ascii_only, forbidden_chars=forbidden_chars,
-        preserve_added_tokens=preserve_added_tokens, seeds=seeds,
-    )
+    model.to(device)
+    with autocast(device, dtype if device.type == 'mps' else torch.float32):
+        summary = evaluate(
+            model, get_encoder(weights_dir if device.type == 'mps' else None), rows, output_dir,
+            max_new_tokens, thinking_budget, temperature, seed, batch_size, no_e, mask_e,
+            metadata={'data_path': str(data_path), 'data_sha256': hashlib.sha256(data).hexdigest(),
+                      'checkpoint': str(path) if path is not None else None, 'device': str(device),
+                      'use_sdpa': use_sdpa, 'limit': limit,
+                      'weights_dir': str(Path(weights_dir).resolve()) if weights_dir is not None else None},
+            ascii_only=ascii_only, forbidden_chars=forbidden_chars,
+            preserve_added_tokens=preserve_added_tokens, seeds=seeds,
+        )
     if judge:
         from scripts.judge_eval import judge_run
 

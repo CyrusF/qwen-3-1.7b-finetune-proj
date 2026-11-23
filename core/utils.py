@@ -16,8 +16,11 @@ def load_qwen3_weights(weights_dir=None):
 
     return cfg, sd
 
-def get_encoder():
+def get_encoder(weights_dir=None):
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B", trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        weights_dir if weights_dir is not None else "Qwen/Qwen3-1.7B",
+        trust_remote_code=True, local_files_only=weights_dir is not None,
+    )
     return tokenizer

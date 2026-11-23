@@ -8,6 +8,7 @@ import random
 
 import torch
 
+from core.devices import autocast, mps_memory, resolve_device
 from core.model import Qwen3ForCausalLM
 from core.utils import get_encoder, load_qwen3_weights
 from scripts.evaluate import NO_E_INSTRUCTION, evaluate
@@ -118,7 +119,7 @@ def write_splits(output_dir, splits, tokenizer, max_length):
 def main(data_path=str(ROOT / 'data/rewrites/rewrites.jsonl'), run_dir='runs/rewrites_sft_r16_seed0',
          batch_size=4, max_length=2048, epochs=5, learning_rate=5e-5, val_size=10,
          seed=0, patience=2, min_delta=0.01, eval_limit=10, max_new_tokens=256, resume_from=None,
-         train_path=None, val_path=None):
+         train_path=None, val_path=None, device=None, weights_dir=None):
     """train_path and val_path (both or neither) train on a fixed split as given; data_path and
     val_size are then ignored."""
     if (train_path is None) != (val_path is None):
@@ -127,8 +128,9 @@ def main(data_path=str(ROOT / 'data/rewrites/rewrites.jsonl'), run_dir='runs/rew
         raise ValueError('Batch, epoch, split, patience and token limits must be positive')
     if not math.isfinite(learning_rate) or learning_rate <= 0 or min_delta < 0 or eval_limit < 0:
         raise ValueError('Invalid learning rate, min_delta or eval_limit')
-    if not torch.cuda.is_available():
-        raise RuntimeError('This training runner requires CUDA; aborting instead of training on CPU')
+    device = resolve_device(device, require_accelerator=True)
+    loss_backend = 'liger' if device.type == 'cuda' else 'torch'
+    micro_batch_size = 1 if device.type == 'mps' else None
     resume_path = Path(resume_from).resolve() if resume_from is not None else None
     source_config = None
     if resume_path is not None:
@@ -144,7 +146,7 @@ def main(data_path=str(ROOT / 'data/rewrites/rewrites.jsonl'), run_dir='runs/rew
         raise FileExistsError(f'Choose a new run_dir: {run_dir}')
     run_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(seed)
-    tokenizer = get_encoder()
+    tokenizer = get_encoder(weights_dir)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     if train_path is not None:
@@ -170,17 +172,19 @@ def main(data_path=str(ROOT / 'data/rewrites/rewrites.jsonl'), run_dir='runs/rew
                   resume_from=str(resume_path) if resume_path else None,
                   resume_sha256=hashlib.sha256(resume_path.read_bytes()).hexdigest() if resume_path else None,
                   objective='assistant_only_chat', system_prompt=NO_E_INSTRUCTION,
-                  thinking=False, mask_e=False, base_weights=str(ROOT / 'weights/qwen3-1.7b'),
+                  thinking=False, mask_e=False, base_weights=str(weights_dir or ROOT / 'weights/qwen3-1.7b'),
                   lora_rank=16, lora_alpha=16, precision='bf16', adapter_precision='float32',
-                  use_sdpa=True, gradient_checkpointing=True, loss_backend='liger', data=audit)
+                  use_sdpa=True, gradient_checkpointing=True, loss_backend=loss_backend, data=audit,
+                  device=str(device), micro_batch_size=micro_batch_size)
     (run_dir / 'config.json').write_text(json.dumps(config, indent=2))
-    free, total = torch.cuda.mem_get_info()
-    cap = min(10 * 1024**3, free - 2 * 1024**3)
-    if cap < 6 * 1024**3:
-        raise RuntimeError('Insufficient free VRAM for a guarded SFT run')
-    torch.cuda.set_per_process_memory_fraction(cap / total)
-    print(f'Train/val: {len(datasets["train"])}/{len(datasets["val"])}; VRAM cap: {cap / 1024**3:.2f} GiB', flush=True)
-    cfg, state = load_qwen3_weights()
+    if device.type == 'cuda':
+        free, total = torch.cuda.mem_get_info()
+        cap = min(10 * 1024**3, free - 2 * 1024**3)
+        if cap < 6 * 1024**3:
+            raise RuntimeError('Insufficient free VRAM for a guarded SFT run')
+        torch.cuda.set_per_process_memory_fraction(cap / total)
+    print(f'Train/val: {len(datasets["train"])}/{len(datasets["val"])}; device: {device}', flush=True)
+    cfg, state = load_qwen3_weights(weights_dir)
     previous_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
@@ -193,9 +197,11 @@ def main(data_path=str(ROOT / 'data/rewrites/rewrites.jsonl'), run_dir='runs/rew
         parameter.requires_grad = name.endswith(('.A', '.B'))
         if parameter.requires_grad:
             parameter.data = parameter.data.float()
+    model.to(device)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=learning_rate)
-    engine = SFTEngine(model, tokenizer, optimizer, gradient_checkpointing=True, loss_backend='liger',
-                       device='cuda', path=run_dir / 'checkpoints/latest.pt', metrics_path=run_dir / 'metrics.jsonl')
+    engine = SFTEngine(model, tokenizer, optimizer, gradient_checkpointing=True, loss_backend=loss_backend,
+                       device=device, path=run_dir / 'checkpoints/latest.pt', metrics_path=run_dir / 'metrics.jsonl',
+                       micro_batch_size=micro_batch_size)
 
     if resume_path is not None:
         engine.load_checkpoint(resume_path)
@@ -209,7 +215,7 @@ def main(data_path=str(ROOT / 'data/rewrites/rewrites.jsonl'), run_dir='runs/rew
     def chat_eval(name):
         if not chat_rows:
             return None
-        with torch.autocast('cuda', dtype=torch.bfloat16):
+        with autocast(device, torch.bfloat16):
             return evaluate(model, tokenizer, chat_rows, run_dir / 'eval' / name,
                             max_new_tokens=max_new_tokens, seed=seed,
                             metadata={'run_dir': str(run_dir), 'stage': name})
@@ -256,8 +262,11 @@ def main(data_path=str(ROOT / 'data/rewrites/rewrites.jsonl'), run_dir='runs/rew
         result['latest_checkpoint_eval'] = chat_eval(f'latest_val{len(chat_rows)}')
     engine.load_checkpoint(best_path)
     result['best_checkpoint_eval'] = chat_eval(f'best_val{len(chat_rows)}')
-    result['peak_cuda_allocated_gib'] = torch.cuda.max_memory_allocated() / 1024**3
-    result['peak_cuda_reserved_gib'] = torch.cuda.max_memory_reserved() / 1024**3
+    if device.type == 'cuda':
+        result['peak_cuda_allocated_gib'] = torch.cuda.max_memory_allocated() / 1024**3
+        result['peak_cuda_reserved_gib'] = torch.cuda.max_memory_reserved() / 1024**3
+    else:
+        result['mps_memory'] = mps_memory()
     (run_dir / 'summary.json').write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2), flush=True)
     return result

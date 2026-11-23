@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Qwen3 MPS 实验课</title>
+  <link rel="stylesheet" href="/lab.css">
+  <script type="module" src="/lab.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="site-title" href="#setup">Qwen3 MPS 实验课</a>
+    <span>本地实验</span>
+  </header>
+  <div class="shell">
+    <aside class="rail">
+      <nav id="lessons" aria-label="课程步骤"></nav>
+    </aside>
+    <main id="main">
+      <header class="lesson-head">
+        <h1 id="title"></h1>
+        <p id="intro"></p>
+        <div id="pipeline" class="pipeline" aria-label="实验流程"></div>
+        <p id="pipeline-note" class="pipeline-note" aria-live="polite" hidden></p>
+      </header>
+      <div class="workspace">
+        <section class="instructions" aria-label="实验说明">
+          <div id="commands"></div>
+          <h2>检查内容</h2>
+          <dl id="checks" class="checks"></dl>
+          <details id="source">
+            <summary>源码导读</summary>
+            <div id="source-body"></div>
+          </details>
+          <div id="exercise"></div>
+          <a id="next" class="next"></a>
+        </section>
+        <section class="observations" aria-labelledby="result-heading">
+          <div class="result-head">
+            <h2 id="result-heading">本机结果</h2>
+            <button type="button" class="quiet" id="refresh">刷新</button>
+          </div>
+          <div id="select-run"></div>
+          <div class="result-panel" id="result" aria-busy="false"></div>
+          <div id="explanation" class="explanation"></div>
+          <div id="history"></div>
+        </section>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

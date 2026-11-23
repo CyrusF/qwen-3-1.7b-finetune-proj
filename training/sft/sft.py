@@ -3,6 +3,7 @@ from pathlib import Path
 
 import torch
 
+from core.devices import mps_memory
 from training.engine import TrainingEngine
 
 logger = logging.getLogger(__name__)
@@ -10,7 +11,8 @@ logger = logging.getLogger(__name__)
 class SFTEngine(TrainingEngine):
      def __init__(self, model, tokenizer, optimizer, gradient_checkpointing, loss_backend, 
                   precision=torch.bfloat16, finetune_mode='lora', 
-                  device=None, path=None, metrics_path=None, label_invalid_val=-100):
+                  device=None, path=None, metrics_path=None, label_invalid_val=-100,
+                  micro_batch_size=None):
           super().__init__()
 
           self.model = model
@@ -32,6 +34,9 @@ class SFTEngine(TrainingEngine):
           if device is None:
                device = 'cuda' if torch.cuda.is_available() else 'cpu'
           self.device = device
+          if micro_batch_size is not None and (type(micro_batch_size) is not int or micro_batch_size < 1):
+               raise ValueError("micro_batch_size must be a positive integer")
+          self.micro_batch_size = micro_batch_size
           for p in self.model.parameters():
                if not p.requires_grad:
                     p.data = p.data.to(self.precision)
@@ -86,6 +91,8 @@ class SFTEngine(TrainingEngine):
                     input_ids, positions, attn_mask, kv_caches
                )
                logits = logits[:, :-1, :].contiguous()
+               if torch.device(self.device).type == "mps":
+                    logits = logits.float()
                log_probs = logits.log_softmax(dim=-1)
           
           safe_labels = labels.masked_fill(~valid, 0)
@@ -97,6 +104,19 @@ class SFTEngine(TrainingEngine):
           loss = -target_log_probs[valid].mean()
           
           return loss
+
+     def _supervised_tokens(self, batch):
+          return (batch["labels"][:, 1:] != self.label_invalid_val).sum().item()
+
+     def _microbatches(self, batch):
+          if self.micro_batch_size is None:
+               yield batch
+               return
+          for start in range(0, len(batch["labels"]), self.micro_batch_size):
+               rows = slice(start, start + self.micro_batch_size)
+               # SFT pads on the right. Trim padding after splitting the batch.
+               width = int(batch["attention_mask"][rows].sum(dim=1).max())
+               yield {key: tensor[rows, :width] for key, tensor in batch.items()}
           
      def _log_training(self, loss_sum, supervised_tokens, input_tokens, started):
           seconds = self._training_time() - started
@@ -117,6 +137,7 @@ class SFTEngine(TrainingEngine):
                supervised_tokens=supervised_tokens,
                seconds=seconds,
                input_tokens_per_sec=input_tokens / seconds,
+               **({"mps_memory": mps_memory()} if torch.device(self.device).type == "mps" else {}),
           )
 
      def fit(self, train_loader, val_loader, epochs=3, eval_every=100, save_every=100, log_every=20):
@@ -140,15 +161,23 @@ class SFTEngine(TrainingEngine):
                for batch in train_loader:
                     self.optimizer.zero_grad()
                     
-                    loss = self.compute_loss(batch)
-                    loss.backward()
+                    num_valid_tokens = self._supervised_tokens(batch)
+                    if num_valid_tokens == 0:
+                         raise ValueError("batch has no supervised target token")
+                    for microbatch in self._microbatches(batch):
+                         tokens = self._supervised_tokens(microbatch)
+                         if tokens:
+                              loss = self.compute_loss(microbatch)
+                              if self.micro_batch_size is None:
+                                   loss.backward()
+                              else:
+                                   (loss * (tokens / num_valid_tokens)).backward()
+                              loss_sum += loss.item() * tokens
 
                     self.optimizer.step()
                     
                     self.global_step += 1
 
-                    num_valid_tokens = (batch["labels"][:, 1:] != self.label_invalid_val).sum().item()
-                    loss_sum += loss.item() * num_valid_tokens
                     supervised_tokens += num_valid_tokens
                     input_tokens += batch["attention_mask"].sum().item()
 
@@ -185,10 +214,13 @@ class SFTEngine(TrainingEngine):
           
           with torch.no_grad():
                for batch in data_loader:
-                    loss = self.compute_loss(batch)
-                    num_valid_tokens = (batch["labels"][:, 1:] != self.label_invalid_val).sum().item()
-                    total_loss += loss.item() * num_valid_tokens
-                    total_tokens += num_valid_tokens
+                    if self._supervised_tokens(batch) == 0:
+                         raise ValueError("batch has no supervised target token")
+                    for microbatch in self._microbatches(batch):
+                         tokens = self._supervised_tokens(microbatch)
+                         if tokens:
+                              total_loss += self.compute_loss(microbatch).item() * tokens
+                              total_tokens += tokens
           if total_tokens == 0:
                raise AssertionError("expected valid data to evaluate on, got sample with zero valid tokens")      
           val_loss = total_loss / total_tokens
