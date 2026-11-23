@@ -211,29 +211,20 @@ async function loadSource() {
   }
 }
 
-const parityDiffNotes = {
-  "scripts/check_parity.py": [
-    "Parity runner",
-    "Forward 在选定的设备上跑 FP32。Hugging Face reference 处理两种 batch 后释放，再加载自定义模型。两边 logits 搬到 CPU 比较，用 masked_fill 排除 padding，四项检查写入 report.json。",
-  ],
-  "core/devices.py": [
-    "设备选择",
-    "课程传入 mps。resolve_device() 先解析设备，再检查对应后端是否可用。只有 device.type 等于 cuda 时才会执行 CUDA 可用性检查。",
-  ],
-  "core/utils.py": [
-    "本地 tokenizer",
-    "get_encoder(weights_dir) 使用 setup 已下载的 tokenizer。Hugging Face reference 和自定义模型也从同一个 weights_dir 加载。",
-  ],
-};
+let mpsDiffs;
 
-async function loadParityDiff() {
-  const section = get("parity-diff");
-  const root = get("parity-diff-body");
-  if (!section.open || root.dataset.loaded || root.getAttribute("aria-busy") === "true") return;
+async function loadMpsDiff() {
+  const id = lesson.id;
+  const section = get("mps-diff");
+  const root = get("mps-diff-body");
+  if (!section.open || root.dataset.lesson === id || root.getAttribute("aria-busy") === "true") return;
   root.textContent = "读取 Git diff…";
   root.setAttribute("aria-busy", "true");
   try {
-    const { base, head, entry, files } = await api("/parity-diff.json");
+    mpsDiffs ??= await api("/mps-diffs.json");
+    if (id !== lesson.id) return;
+    const { base, head, patches, chapters } = mpsDiffs;
+    const { entry, tabs: files } = chapters[id];
     const comparison = element("a", base.slice(0, 7) + " → " + head.slice(0, 7));
     comparison.href = "https://github.com/CyrusF/qwen-3-1.7b-finetune-proj/compare/" + base + "..." + head;
     const revision = element("p", "上游与 MPS 适配的版本对比 ", "muted diff-description");
@@ -247,7 +238,7 @@ async function loadParityDiff() {
     code.tabIndex = 0;
     code.setAttribute("aria-label", "Git diff");
     const buttons = files.map((file, index) => {
-      const button = element("button", parityDiffNotes[file.path][0], "quiet");
+      const button = element("button", file.label, "quiet");
       button.type = "button";
       button.onclick = () => show(index);
       tabs.append(button);
@@ -255,9 +246,10 @@ async function loadParityDiff() {
     });
     function show(index) {
       const file = files[index];
-      note.textContent = parityDiffNotes[file.path][1];
-      path.textContent = file.path;
-      code.replaceChildren(...file.patch.trimEnd().split("\n").map(line => {
+      const patch = patches[file.patch];
+      note.textContent = file.note;
+      path.textContent = patch.path + (patch.excerpt ? "（节选）" : "");
+      code.replaceChildren(...patch.text.trimEnd().split("\n").map(line => {
         const kind = /^(diff |index |new file |--- |\+\+\+ |@@)/.test(line) ? "diff-header"
           : line.startsWith("+") ? "diff-added" : line.startsWith("-") ? "diff-removed" : null;
         return element("span", line + "\n", kind);
@@ -265,14 +257,14 @@ async function loadParityDiff() {
       buttons.forEach((button, i) => button.setAttribute("aria-pressed", String(i === index)));
       code.scrollTop = code.scrollLeft = 0;
     }
-    root.replaceChildren(revision, element("p", "课程入口把 mps、权重目录和 report.json 路径传给 parity runner。", "diff-description"),
+    root.replaceChildren(revision, element("p", entry.note, "diff-description"),
       element("p", entry.path + ":" + entry.line, "trace"), entryCode, tabs, note, path, code);
-    root.dataset.loaded = "true";
+    root.dataset.lesson = id;
     show(0);
   } catch {
-    root.textContent = "Git diff 读取失败。重新展开以重试。";
+    if (id === lesson.id) root.textContent = "Git diff 读取失败。重新展开以重试。";
   } finally {
-    root.removeAttribute("aria-busy");
+    if (id === lesson.id) root.removeAttribute("aria-busy");
   }
 }
 
@@ -320,9 +312,11 @@ function showLesson() {
   get("source").open = false;
   get("source-body").replaceChildren();
   get("source-body").dataset.lesson = "";
-  const diff = get("parity-diff");
-  diff.hidden = lesson.id !== "parity";
-  if (diff.hidden) diff.open = false;
+  get("mps-diff").open = false;
+  const diffBody = get("mps-diff-body");
+  diffBody.replaceChildren();
+  diffBody.dataset.lesson = "";
+  diffBody.removeAttribute("aria-busy");
   const exercise = get("exercise");
   exercise.replaceChildren();
   if (lesson.id === "grpo-one") rewardExercise(exercise);
@@ -359,7 +353,7 @@ function showLesson() {
 
 get("refresh").onclick = refresh;
 get("source").addEventListener("toggle", loadSource);
-get("parity-diff").addEventListener("toggle", loadParityDiff);
+get("mps-diff").addEventListener("toggle", loadMpsDiff);
 window.addEventListener("hashchange", showLesson);
 showLesson();
 setInterval(refresh, 2200);
