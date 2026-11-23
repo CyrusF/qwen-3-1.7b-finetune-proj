@@ -63,7 +63,13 @@ h3 { margin: 0 0 10px; font-size: 18px; line-height: 1.4; }
 details { border: 1px solid var(--line); border-radius: 7px; margin-top: 12px; }
 details > summary { cursor: pointer; font-weight: 670; padding: 10px 12px; }
 details > div, details > pre { margin: 0 12px 12px; }
-#source > summary { font-size: 20px; }
+#source > summary, #parity-diff > summary { font-size: 20px; }
+.diff-description { margin: 8px 0; }
+#parity-diff .source-tabs { margin-top: 15px; }
+pre.diff-entry { white-space: pre-wrap; overflow-wrap: anywhere; }
+.diff-added { color: #a6eab5; }
+.diff-removed { color: #ffa6b2; }
+.diff-header { color: #abcbff; }
 .source-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 9px; }
 .source-tabs button { font: 12px/1.5 var(--mono); overflow-wrap: anywhere; }
 .source-tabs button[aria-pressed="true"] { background: var(--blue-wash); color: var(--blue); border-color: var(--blue); }

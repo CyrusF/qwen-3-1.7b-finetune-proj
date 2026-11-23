@@ -17,6 +17,7 @@ ASSETS = {
     "/lab.js": ("lab.js", "text/javascript; charset=utf-8"),
     "/lessons.js": ("lessons.js", "text/javascript; charset=utf-8"),
     "/results.js": ("results.js", "text/javascript; charset=utf-8"),
+    "/parity-diff.json": ("parity-diff.json", "application/json; charset=utf-8"),
 }
 SOURCES = {
     "setup": [("core/devices.py", "resolve_device"), ("mps_lab/experiments.py", "setup")],
